@@ -102,8 +102,8 @@ class WorkerProcess:
             except asyncio.QueueFull:
                 pass
 
-            # Log non-debug messages
-            if action != "debug" and action != "audio_received":
+            # Log non-debug messages (skip high-frequency audio events)
+            if action not in ("debug", "audio_received"):
                 logger.info("[%s] %s", self.name, msg)
 
     async def wait_for(self, action: str, timeout: float = 30.0) -> dict:
@@ -137,6 +137,18 @@ class WorkerManager:
     def workers(self) -> dict[str, WorkerProcess]:
         return dict(self._workers)
 
+    @staticmethod
+    async def _read_stderr(name: str, proc: asyncio.subprocess.Process) -> None:
+        """Read and log stderr from a worker subprocess."""
+        assert proc.stderr is not None
+        while True:
+            raw = await proc.stderr.readline()
+            if not raw:
+                break
+            line = raw.decode().strip()
+            if line:
+                logger.warning("[%s stderr] %s", name, line)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -169,6 +181,10 @@ class WorkerManager:
         wp = WorkerProcess(name=name, process=proc)
         wp._reader_task = asyncio.create_task(
             wp._read_loop(), name=f"worker-reader-{name}"
+        )
+        # Also read stderr for crash diagnostics
+        asyncio.create_task(
+            self._read_stderr(name, proc), name=f"worker-stderr-{name}"
         )
 
         self._workers[name] = wp

@@ -86,24 +86,18 @@ class AudioSource:
     def on_mic_initialize(self, sender) -> None:
         self.sender = sender
         send_response({"action": "mic_init"})
-        # Start send loop immediately — virtual mic bypasses mute state
-        if not self.is_sending:
-            self.is_sending = True
-            self._stop.clear()
-            self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
-            self._send_thread.start()
-            send_response({"action": "mic_start", "source": "on_init"})
-        # Also try unmute if callback is set
+        # Trigger unmute — this causes on_mic_start_send to fire
         if self._on_ready_callback:
             self._on_ready_callback()
 
     def on_mic_start_send(self) -> None:
+        # Only start send loop when SDK signals it's ready to receive audio
         if not self.is_sending:
             self.is_sending = True
             self._stop.clear()
             self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
             self._send_thread.start()
-        send_response({"action": "mic_start", "source": "on_start_send"})
+        send_response({"action": "mic_start"})
 
     def on_mic_stop_send(self) -> None:
         self.is_sending = False
@@ -119,6 +113,8 @@ class AudioSource:
     def queue_audio(self, data: bytes) -> None:
         with self._lock:
             self._buffer.extend(data)
+            buf_len = len(self._buffer)
+        send_response({"action": "audio_queued", "bytes": len(data), "buffer": buf_len, "sending": self.is_sending, "has_sender": self.sender is not None})
 
     def clear_buffer(self) -> int:
         with self._lock:
@@ -131,7 +127,24 @@ class AudioSource:
     def _send_loop(self) -> None:
         interval = self.chunk_samples / self.sample_rate  # 0.02 s
         silence = bytes(self.chunk_bytes)
-        silence_count = 0
+        chunks_sent = 0
+        first_audio = True
+
+        send_response({"action": "send_loop_started", "chunk_bytes": self.chunk_bytes})
+
+        # Wait for actual audio before calling sender.send()
+        # This gives the SDK time to fully initialize its audio subsystem
+        while not self._stop.is_set() and self.sender:
+            with self._lock:
+                has_audio = len(self._buffer) >= self.chunk_bytes
+            if has_audio:
+                break
+            time.sleep(0.02)
+
+        if self._stop.is_set() or not self.sender:
+            return
+
+        send_response({"action": "send_loop_audio_ready"})
 
         while not self._stop.is_set() and self.sender:
             t0 = time.time()
@@ -144,15 +157,19 @@ class AudioSource:
 
             if chunk:
                 self.sender.send(chunk, self.sample_rate, zoom.ZoomSDKAudioChannel_Mono)
-                silence_count = 0
-            elif silence_count < 50:
+                chunks_sent += 1
+                if chunks_sent % 50 == 1:
+                    send_response({"action": "sending_audio", "chunks_sent": chunks_sent})
+            else:
+                # Send brief silence between lines to keep audio channel active
                 self.sender.send(silence, self.sample_rate, zoom.ZoomSDKAudioChannel_Mono)
-                silence_count += 1
 
             elapsed = time.time() - t0
             remaining = interval - elapsed
             if remaining > 0.001:
                 time.sleep(remaining)
+
+        send_response({"action": "send_loop_ended", "total_chunks_sent": chunks_sent})
 
 
 # ---------------------------------------------------------------------------
