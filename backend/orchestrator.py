@@ -94,18 +94,25 @@ class ConversationOrchestrator:
             await self._cleanup()
 
     async def _join_workers(self, meeting_id: str, password: str):
-        """Spawn two workers and join them to the meeting."""
-        for speaker in self.conversation.speakers:
-            worker = await self.worker_mgr.spawn_worker(speaker.name)
-            self._workers[speaker.name] = worker
+        """Spawn two workers and join them to the meeting.
 
-            # Update conversation worker status
+        Uses parallel joins with retry. If a worker crashes (QEMU segfault),
+        the surviving worker continues and the crashed one is retried.
+        """
+        max_retries = 3
+
+        for speaker in self.conversation.speakers:
             ws = WorkerStatus(
                 name=speaker.name, voice=speaker.voice, status="joining"
             )
             self.conversation.workers.append(ws)
 
-        # Join both in parallel
+        # Spawn all workers
+        for speaker in self.conversation.speakers:
+            worker = await self.worker_mgr.spawn_worker(speaker.name)
+            self._workers[speaker.name] = worker
+
+        # Join all in parallel
         join_tasks = []
         for speaker in self.conversation.speakers:
             worker = self._workers[speaker.name]
@@ -114,12 +121,35 @@ class ConversationOrchestrator:
                     worker, meeting_id, password, speaker.name
                 )
             )
-
         await asyncio.gather(*join_tasks)
 
-        # Unmute both workers
+        # Wait a bit then check who survived and unmute them
+        await asyncio.sleep(3.0)
+
         for speaker in self.conversation.speakers:
             worker = self._workers[speaker.name]
+            if not worker.alive:
+                # Worker crashed — retry
+                logger.warning("Worker %r crashed after join, retrying", speaker.name)
+                for attempt in range(1, max_retries + 1):
+                    await asyncio.sleep(3.0)
+                    worker = await self.worker_mgr.spawn_worker(speaker.name)
+                    self._workers[speaker.name] = worker
+                    joined = await self.worker_mgr.join_meeting(
+                        worker, meeting_id, password, speaker.name
+                    )
+                    if not joined:
+                        continue
+                    await asyncio.sleep(3.0)
+                    if worker.alive:
+                        logger.info("Worker %r retry %d succeeded", speaker.name, attempt)
+                        break
+                    logger.warning("Worker %r retry %d crashed", speaker.name, attempt)
+                else:
+                    raise RuntimeError(
+                        f"Worker {speaker.name} crashed {max_retries} times"
+                    )
+
             await self.worker_mgr.unmute_audio(worker)
 
         # Update statuses

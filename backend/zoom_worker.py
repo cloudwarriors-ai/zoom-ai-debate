@@ -146,6 +146,14 @@ class AudioSource:
 
         send_response({"action": "send_loop_audio_ready"})
 
+        # Extra stabilization delay for QEMU — the SDK audio subsystem
+        # needs time after on_mic_start_send before sender.send() is safe
+        stabilize_sec = float(os.environ.get("AUDIO_STABILIZE_SEC", "3"))
+        if stabilize_sec > 0:
+            send_response({"action": "audio_stabilizing", "delay_sec": stabilize_sec})
+            time.sleep(stabilize_sec)
+            send_response({"action": "audio_stabilized"})
+
         while not self._stop.is_set() and self.sender:
             t0 = time.time()
             chunk: bytes | None = None
@@ -215,6 +223,7 @@ class ZoomWorker:
         self._meeting_cb = None
         self._mic_cb = None
         self._audio_helper = None
+        self._unmute_timer = None
 
         self.audio_source = AudioSource(sample_rate)
 
@@ -349,19 +358,33 @@ class ZoomWorker:
                 send_response({"action": "error", "message": "No audio helper"})
                 return
 
-            # Set up unmute callback — called from on_mic_initialize after sender is ready
-            def _unmute_after_init():
-                audio_ctrl = self.meeting_service.GetMeetingAudioController()
-                participants_ctrl = self.meeting_service.GetMeetingParticipantsController()
-                if audio_ctrl and participants_ctrl:
-                    myself = participants_ctrl.GetMySelfUser()
-                    my_user_id = myself.GetUserID() if myself else 0
-                    can_unmute = audio_ctrl.CanUnMuteBySelf()
-                    send_response({"action": "debug", "message": f"user_id={my_user_id}, can_unmute_self={can_unmute}"})
-                    result = audio_ctrl.UnMuteAudio(my_user_id)
-                    send_response({"action": "unmute_after_mic_init", "result": str(result), "user_id": my_user_id, "can_unmute": can_unmute})
+            # Deferred unmute — use QTimer to let the SDK stabilize after mic_init
+            # Calling UnMuteAudio synchronously from on_mic_initialize causes
+            # segfaults under QEMU emulation.
+            def _schedule_unmute():
+                delay_ms = int(float(os.environ.get("UNMUTE_DELAY_MS", "2000")))
+                send_response({"action": "debug", "message": f"scheduling unmute in {delay_ms}ms"})
 
-            self.audio_source._on_ready_callback = _unmute_after_init
+                def _do_unmute():
+                    try:
+                        audio_ctrl = self.meeting_service.GetMeetingAudioController()
+                        participants_ctrl = self.meeting_service.GetMeetingParticipantsController()
+                        if audio_ctrl and participants_ctrl:
+                            myself = participants_ctrl.GetMySelfUser()
+                            my_user_id = myself.GetUserID() if myself else 0
+                            can_unmute = audio_ctrl.CanUnMuteBySelf()
+                            send_response({"action": "debug", "message": f"user_id={my_user_id}, can_unmute_self={can_unmute}"})
+                            result = audio_ctrl.UnMuteAudio(my_user_id)
+                            send_response({"action": "unmute_after_mic_init", "result": str(result), "user_id": my_user_id, "can_unmute": can_unmute})
+                    except Exception as exc:
+                        send_response({"action": "error", "message": f"deferred unmute failed: {exc}"})
+
+                self._unmute_timer = QTimer()
+                self._unmute_timer.setSingleShot(True)
+                self._unmute_timer.timeout.connect(_do_unmute)
+                self._unmute_timer.start(delay_ms)
+
+            self.audio_source._on_ready_callback = _schedule_unmute
 
             self._mic_cb = zoom.ZoomSDKVirtualAudioMicEventCallbacks(
                 onMicInitializeCallback=self.audio_source.on_mic_initialize,
