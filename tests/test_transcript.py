@@ -85,21 +85,15 @@ class TestParseTranscriptResponse:
 
 class TestGenerateTranscript:
     @pytest.mark.asyncio
-    async def test_calls_anthropic_and_parses(self):
-        mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(text=json.dumps([
-                {"speaker": "Alex", "text": "I think AI needs regulation."},
-                {"speaker": "Jordan", "text": "But innovation requires freedom."},
-                {"speaker": "Alex", "text": "Freedom without guardrails is dangerous."},
-                {"speaker": "Jordan", "text": "Guardrails shouldn't strangle progress."},
-            ]))
-        ]
+    async def test_calls_claude_cli_and_parses(self):
+        cli_output = json.dumps([
+            {"speaker": "Alex", "text": "I think AI needs regulation."},
+            {"speaker": "Jordan", "text": "But innovation requires freedom."},
+            {"speaker": "Alex", "text": "Freedom without guardrails is dangerous."},
+            {"speaker": "Jordan", "text": "Guardrails shouldn't strangle progress."},
+        ])
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-        with patch("transcript.anthropic.AsyncAnthropic", return_value=mock_client):
+        with patch("transcript._run_claude_cli", new_callable=AsyncMock, return_value=cli_output) as mock_cli:
             result = await generate_transcript(
                 topic="AI regulation",
                 num_turns=2,
@@ -110,25 +104,18 @@ class TestGenerateTranscript:
         assert len(result) == 4
         assert result[0].speaker == "Alex"
         assert result[1].speaker == "Jordan"
-        mock_client.messages.create.assert_called_once()
+        mock_cli.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_retries_on_parse_error(self):
-        bad_response = MagicMock()
-        bad_response.content = [MagicMock(text="not json")]
-
-        good_response = MagicMock()
-        good_response.content = [
-            MagicMock(text=json.dumps([
+        with patch(
+            "transcript._run_claude_cli",
+            new_callable=AsyncMock,
+            side_effect=["not json", json.dumps([
                 {"speaker": "A", "text": "Line 1."},
                 {"speaker": "B", "text": "Line 2."},
-            ]))
-        ]
-
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(side_effect=[bad_response, good_response])
-
-        with patch("transcript.anthropic.AsyncAnthropic", return_value=mock_client):
+            ])],
+        ) as mock_cli:
             result = await generate_transcript(
                 topic="Test",
                 num_turns=1,
@@ -137,4 +124,4 @@ class TestGenerateTranscript:
             )
 
         assert len(result) == 2
-        assert mock_client.messages.create.call_count == 2
+        assert mock_cli.call_count == 2

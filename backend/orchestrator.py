@@ -117,6 +117,11 @@ class ConversationOrchestrator:
 
         await asyncio.gather(*join_tasks)
 
+        # Unmute both workers
+        for speaker in self.conversation.speakers:
+            worker = self._workers[speaker.name]
+            await self.worker_mgr.unmute_audio(worker)
+
         # Update statuses
         for ws in self.conversation.workers:
             ws.status = "in_meeting"
@@ -131,6 +136,7 @@ class ConversationOrchestrator:
             synth = VoiceSynthesizer(
                 api_key=settings.openai_api_key,
                 voice=speaker.voice,
+                model=settings.openai_realtime_model,
             )
             await synth.connect()
             self._synths[speaker.name] = synth

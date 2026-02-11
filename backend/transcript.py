@@ -1,11 +1,18 @@
-"""Claude-powered transcript generator for AI debates."""
+"""Transcript generator for AI debates.
 
+Supports multiple backends:
+- Claude CLI (default for local dev — no API key needed)
+- Anthropic API (set ANTHROPIC_API_KEY)
+- OpenAI API (set OPENAI_API_KEY + LLM_BACKEND=openai)
+- Any OpenAI-compatible API (set LLM_BASE_URL + LLM_API_KEY)
+"""
+
+import asyncio
 import json
 import logging
+import os
+import shutil
 
-import anthropic
-
-from config import settings
 from models import Speaker, TranscriptLine
 
 logger = logging.getLogger(__name__)
@@ -46,12 +53,7 @@ def _build_user_prompt(
 def _parse_transcript_response(
     raw: str, speaker_a: Speaker, speaker_b: Speaker, expected_lines: int
 ) -> list[TranscriptLine]:
-    """Parse Claude's JSON response into TranscriptLine objects.
-
-    Validates speaker names and line count. Raises ValueError on
-    malformed output so the caller can decide how to handle it.
-    """
-    # Strip markdown fences if Claude wraps them despite instructions
+    """Parse LLM JSON response into TranscriptLine objects."""
     text = raw.strip()
     if text.startswith("```"):
         first_newline = text.index("\n")
@@ -88,44 +90,141 @@ def _parse_transcript_response(
     return result
 
 
+# ---------- Backend: Claude CLI ----------
+
+CLAUDE_CLI_TIMEOUT_SEC = 120
+
+
+def _find_claude_cli() -> str:
+    path = shutil.which("claude")
+    if not path:
+        raise RuntimeError("claude CLI not found on PATH")
+    return path
+
+
+async def _run_claude_cli(system_prompt: str, user_prompt: str) -> str:
+    claude_bin = _find_claude_cli()
+    cmd = [
+        claude_bin,
+        "--print",
+        "--system-prompt", system_prompt,
+        "--model", "sonnet",
+        "--output-format", "text",
+        "--allowedTools", "",
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=user_prompt.encode()),
+            timeout=CLAUDE_CLI_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"claude CLI timed out after {CLAUDE_CLI_TIMEOUT_SEC}s")
+
+    if proc.returncode != 0:
+        err_msg = stderr.decode().strip()
+        raise RuntimeError(f"claude CLI exited with code {proc.returncode}: {err_msg}")
+
+    return stdout.decode()
+
+
+# ---------- Backend: Anthropic API ----------
+
+async def _run_anthropic_api(system_prompt: str, user_prompt: str) -> str:
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    response = await client.messages.create(
+        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    return response.content[0].text
+
+
+# ---------- Backend: OpenAI-compatible API ----------
+
+async def _run_openai_api(system_prompt: str, user_prompt: str) -> str:
+    import openai
+
+    kwargs = {}
+    base_url = os.getenv("LLM_BASE_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    client = openai.AsyncOpenAI(
+        api_key=os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY")),
+        **kwargs,
+    )
+    response = await client.chat.completions.create(
+        model=os.getenv("LLM_MODEL", "gpt-4o"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=4096,
+    )
+    return response.choices[0].message.content
+
+
+# ---------- Backend selection ----------
+
+def _get_backend():
+    """Pick the LLM backend based on environment."""
+    backend = os.getenv("LLM_BACKEND", "").lower()
+
+    if backend == "anthropic":
+        return _run_anthropic_api
+    if backend == "openai":
+        return _run_openai_api
+
+    # Auto-detect from env vars
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return _run_anthropic_api
+    if os.getenv("LLM_BASE_URL"):
+        return _run_openai_api
+
+    # Default: Claude CLI
+    return _run_claude_cli
+
+
+# ---------- Public API ----------
+
 async def generate_transcript(
     topic: str, num_turns: int, speaker_a: Speaker, speaker_b: Speaker
 ) -> list[TranscriptLine]:
-    """Generate a debate transcript using Claude.
+    """Generate a debate transcript using the configured LLM backend.
 
-    Args:
-        topic: The debate topic.
-        num_turns: Number of lines per speaker.
-        speaker_a: First speaker (goes first).
-        speaker_b: Second speaker.
-
-    Returns:
-        Alternating list of TranscriptLine objects.
-
-    Raises:
-        anthropic.APIError: On API communication failure.
-        ValueError: On unparseable response after retries.
+    Backend selection (in order):
+    1. LLM_BACKEND env var (explicit: "anthropic", "openai", "cli")
+    2. ANTHROPIC_API_KEY set → Anthropic API
+    3. LLM_BASE_URL set → OpenAI-compatible API
+    4. Default → Claude CLI
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    run_llm = _get_backend()
+    backend_name = run_llm.__name__
     user_prompt = _build_user_prompt(topic, num_turns, speaker_a, speaker_b)
     expected_lines = num_turns * 2
 
     logger.info(
-        "Generating transcript: topic=%r, turns=%d, speakers=%s/%s",
-        topic, num_turns, speaker_a.name, speaker_b.name,
+        "Generating transcript via %s: topic=%r, turns=%d, speakers=%s/%s",
+        backend_name, topic, num_turns, speaker_a.name, speaker_b.name,
     )
 
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            response = await client.messages.create(
-                model="claude-sonnet-4-5-20250929",
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            raw_text = response.content[0].text
-            logger.debug("Claude response (attempt %d): %s", attempt + 1, raw_text[:200])
+            raw_text = await run_llm(SYSTEM_PROMPT, user_prompt)
+            logger.debug("LLM response (attempt %d): %s", attempt + 1, raw_text[:200])
 
             transcript = _parse_transcript_response(
                 raw_text, speaker_a, speaker_b, expected_lines
@@ -136,11 +235,6 @@ async def generate_transcript(
         except (json.JSONDecodeError, ValueError, KeyError, IndexError) as exc:
             last_error = exc
             logger.warning("Parse error on attempt %d: %s", attempt + 1, exc)
-            # Retry once with a nudge
             continue
-
-        except anthropic.APIError:
-            logger.exception("Anthropic API error during transcript generation")
-            raise
 
     raise ValueError(f"Failed to parse transcript after 2 attempts: {last_error}")

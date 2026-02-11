@@ -79,19 +79,31 @@ class AudioSource:
         self.is_sending = False
         self._send_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._on_ready_callback = None  # Called after mic init to trigger unmute
 
     # -- SDK callbacks (real mode) ------------------------------------------
 
     def on_mic_initialize(self, sender) -> None:
         self.sender = sender
         send_response({"action": "mic_init"})
+        # Start send loop immediately — virtual mic bypasses mute state
+        if not self.is_sending:
+            self.is_sending = True
+            self._stop.clear()
+            self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
+            self._send_thread.start()
+            send_response({"action": "mic_start", "source": "on_init"})
+        # Also try unmute if callback is set
+        if self._on_ready_callback:
+            self._on_ready_callback()
 
     def on_mic_start_send(self) -> None:
-        self.is_sending = True
-        self._stop.clear()
-        self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
-        self._send_thread.start()
-        send_response({"action": "mic_start"})
+        if not self.is_sending:
+            self.is_sending = True
+            self._stop.clear()
+            self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
+            self._send_thread.start()
+        send_response({"action": "mic_start", "source": "on_start_send"})
 
     def on_mic_stop_send(self) -> None:
         self.is_sending = False
@@ -320,18 +332,38 @@ class ZoomWorker:
                 send_response({"action": "error", "message": "No audio helper"})
                 return
 
+            # Set up unmute callback — called from on_mic_initialize after sender is ready
+            def _unmute_after_init():
+                audio_ctrl = self.meeting_service.GetMeetingAudioController()
+                participants_ctrl = self.meeting_service.GetMeetingParticipantsController()
+                if audio_ctrl and participants_ctrl:
+                    myself = participants_ctrl.GetMySelfUser()
+                    my_user_id = myself.GetUserID() if myself else 0
+                    can_unmute = audio_ctrl.CanUnMuteBySelf()
+                    send_response({"action": "debug", "message": f"user_id={my_user_id}, can_unmute_self={can_unmute}"})
+                    result = audio_ctrl.UnMuteAudio(my_user_id)
+                    send_response({"action": "unmute_after_mic_init", "result": str(result), "user_id": my_user_id, "can_unmute": can_unmute})
+
+            self.audio_source._on_ready_callback = _unmute_after_init
+
             self._mic_cb = zoom.ZoomSDKVirtualAudioMicEventCallbacks(
                 onMicInitializeCallback=self.audio_source.on_mic_initialize,
                 onMicStartSendCallback=self.audio_source.on_mic_start_send,
                 onMicStopSendCallback=self.audio_source.on_mic_stop_send,
                 onMicUninitializedCallback=self.audio_source.on_mic_uninitialized,
             )
-            self._audio_helper.setExternalAudioSource(self._mic_cb)
 
+            # Register virtual mic with SDK
+            result = self._audio_helper.setExternalAudioSource(self._mic_cb)
+            send_response({"action": "set_audio_source", "result": str(result)})
+
+            # Join VoIP channel — required for unmute permission
             audio_ctrl = self.meeting_service.GetMeetingAudioController()
             if audio_ctrl:
-                audio_ctrl.UnMuteAudio(0)
+                voip_result = audio_ctrl.JoinVoip()
+                send_response({"action": "join_voip", "result": str(voip_result)})
 
+            # on_mic_initialize fires async → calls UnMuteAudio → triggers on_mic_start_send
             send_response({"action": "audio_setup", "success": True})
         except Exception as exc:
             send_response({"action": "error", "message": f"Audio setup failed: {exc}"})
@@ -353,10 +385,14 @@ class ZoomWorker:
     def unmute_audio(self) -> None:
         try:
             if self.meeting_service:
-                ctrl = self.meeting_service.GetMeetingAudioController()
-                if ctrl:
-                    ctrl.UnMuteAudio(0)
-                    send_response({"action": "unmute_audio", "success": True})
+                audio_ctrl = self.meeting_service.GetMeetingAudioController()
+                participants_ctrl = self.meeting_service.GetMeetingParticipantsController()
+                if audio_ctrl and participants_ctrl:
+                    myself = participants_ctrl.GetMySelfUser()
+                    my_user_id = myself.GetUserID() if myself else 0
+                    can_unmute = audio_ctrl.CanUnMuteBySelf()
+                    result = audio_ctrl.UnMuteAudio(my_user_id)
+                    send_response({"action": "unmute_audio", "result": str(result), "user_id": my_user_id, "can_unmute": can_unmute})
                     return
             send_response({"action": "unmute_audio", "success": False, "error": "No controller"})
         except Exception as exc:

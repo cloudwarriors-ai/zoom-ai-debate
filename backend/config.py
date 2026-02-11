@@ -9,7 +9,6 @@ load_dotenv()
 class Settings:
     """Application settings loaded from environment."""
 
-    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     zoom_client_id: str = os.getenv("ZOOM_CLIENT_ID", "")
     zoom_client_secret: str = os.getenv("ZOOM_CLIENT_SECRET", "")
@@ -20,7 +19,7 @@ class Settings:
 
     # OpenAI Realtime API
     openai_realtime_model: str = os.getenv(
-        "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17"
+        "OPENAI_REALTIME_MODEL", "gpt-realtime-2025-08-28"
     )
     openai_realtime_url: str = "wss://api.openai.com/v1/realtime"
 

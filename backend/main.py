@@ -1,6 +1,5 @@
 """FastAPI server for the AI Debate application."""
 
-import asyncio
 import logging
 
 import uvicorn
@@ -10,11 +9,10 @@ from config import settings
 from models import (
     Conversation,
     ConversationStatus,
-    CreateConversationRequest,
     PerformRequest,
+    UploadTranscriptRequest,
 )
 from orchestrator import ConversationOrchestrator
-from transcript import generate_transcript
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,16 +20,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Zoom AI Debate", version="0.1.0")
+app = FastAPI(title="Zoom AI Debate", version="0.2.0")
 
-# In-memory conversation store
 _conversations: dict[str, Conversation] = {}
 _orchestrators: dict[str, ConversationOrchestrator] = {}
+
+TRANSCRIPT_FORMAT = {
+    "description": "Upload a debate transcript for two speakers to perform in a Zoom meeting.",
+    "schema": {
+        "topic": "string — the debate topic",
+        "speakers": [
+            {"name": "string — display name in meeting", "voice": "string — OpenAI voice id", "perspective": "string — optional, their stance"},
+        ],
+        "transcript": [
+            {"speaker": "string — must match a speaker name", "text": "string — the line to speak"},
+        ],
+    },
+    "available_voices": settings.available_voices,
+    "example": {
+        "topic": "Should AI be regulated?",
+        "speakers": [
+            {"name": "Alex", "voice": "ash", "perspective": "pro-regulation"},
+            {"name": "Jordan", "voice": "coral", "perspective": "industry self-regulation"},
+        ],
+        "transcript": [
+            {"speaker": "Alex", "text": "We need government oversight of AI systems."},
+            {"speaker": "Jordan", "text": "Innovation requires freedom, not bureaucracy."},
+            {"speaker": "Alex", "text": "Freedom without guardrails is dangerous."},
+            {"speaker": "Jordan", "text": "Bad regulation is worse than no regulation."},
+        ],
+    },
+}
 
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "conversations": len(_conversations)}
+
+
+@app.get("/api/format")
+async def get_format():
+    """Return the expected transcript format so any LLM can generate it."""
+    return TRANSCRIPT_FORMAT
 
 
 @app.get("/api/conversations")
@@ -43,35 +73,31 @@ async def list_conversations():
 
 
 @app.post("/api/conversations", status_code=201)
-async def create_conversation(req: CreateConversationRequest):
-    """Generate a conversation transcript using Claude."""
+async def create_conversation(req: UploadTranscriptRequest):
+    """Upload a pre-generated transcript."""
+    # Validate speaker names in transcript match declared speakers
+    valid_names = {s.name for s in req.speakers}
+    for i, line in enumerate(req.transcript):
+        if line.speaker not in valid_names:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Line {i}: speaker '{line.speaker}' not in {valid_names}",
+            )
+
     conversation = Conversation(
         topic=req.topic,
-        speakers=[req.speaker_a, req.speaker_b],
+        speakers=req.speakers,
+        transcript=req.transcript,
+        status=ConversationStatus.READY,
     )
     _conversations[conversation.id] = conversation
 
-    try:
-        transcript = await generate_transcript(
-            topic=req.topic,
-            num_turns=req.num_turns,
-            speaker_a=req.speaker_a,
-            speaker_b=req.speaker_b,
-        )
-        conversation.transcript = transcript
-        conversation.status = ConversationStatus.READY
-        logger.info(
-            "Created conversation %s: %d lines on '%s'",
-            conversation.id,
-            len(transcript),
-            req.topic,
-        )
-    except Exception as e:
-        conversation.status = ConversationStatus.ERROR
-        conversation.error = str(e)
-        logger.error("Failed to generate transcript: %s", e)
-        raise HTTPException(status_code=500, detail=f"Transcript generation failed: {e}")
-
+    logger.info(
+        "Uploaded conversation %s: %d lines on '%s'",
+        conversation.id,
+        len(req.transcript),
+        req.topic,
+    )
     return conversation
 
 

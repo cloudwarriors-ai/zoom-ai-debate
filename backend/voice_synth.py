@@ -160,50 +160,50 @@ class VoiceSynthesizer:
         error_msg: str | None = None
 
         try:
-            async with asyncio.timeout(SYNTHESIS_TIMEOUT_SEC):
-                while not done_event.is_set():
-                    raw = await self._ws.recv()
-                    msg = json.loads(raw)
-                    msg_type = msg.get("type", "")
+            deadline = asyncio.get_event_loop().time() + SYNTHESIS_TIMEOUT_SEC
+            while not done_event.is_set():
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                msg_type = msg.get("type", "")
 
-                    if msg_type == "response.audio.delta":
-                        chunk = base64.b64decode(msg["delta"])
-                        audio_chunks.append(chunk)
+                if msg_type == "response.audio.delta":
+                    chunk = base64.b64decode(msg["delta"])
+                    audio_chunks.append(chunk)
 
-                    elif msg_type == "response.done":
-                        done_event.set()
+                elif msg_type == "response.done":
+                    done_event.set()
 
-                    elif msg_type == "response.audio.done":
-                        # Audio stream complete, response.done follows shortly
-                        pass
+                elif msg_type == "response.audio.done":
+                    pass
 
-                    elif msg_type == "response.text.delta":
-                        # Text transcript delta, ignore
-                        pass
+                elif msg_type == "response.text.delta":
+                    pass
 
-                    elif msg_type == "response.text.done":
-                        pass
+                elif msg_type == "response.text.done":
+                    pass
 
-                    elif msg_type in (
-                        "response.created",
-                        "response.output_item.added",
-                        "response.output_item.done",
-                        "response.content_part.added",
-                        "response.content_part.done",
-                        "rate_limits.updated",
-                    ):
-                        # Expected lifecycle events, no action needed
-                        pass
+                elif msg_type in (
+                    "response.created",
+                    "response.output_item.added",
+                    "response.output_item.done",
+                    "response.content_part.added",
+                    "response.content_part.done",
+                    "rate_limits.updated",
+                ):
+                    pass
 
-                    elif msg_type == "error":
-                        error_detail = msg.get("error", {})
-                        error_msg = error_detail.get("message", str(error_detail))
-                        done_event.set()
+                elif msg_type == "error":
+                    error_detail = msg.get("error", {})
+                    error_msg = error_detail.get("message", str(error_detail))
+                    done_event.set()
 
-                    else:
-                        logger.debug("Unhandled message type: %s", msg_type)
+                else:
+                    logger.debug("Unhandled message type: %s", msg_type)
 
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             raise VoiceSynthError(
                 f"Synthesis timed out after {SYNTHESIS_TIMEOUT_SEC}s for text: {text[:80]}"
             )

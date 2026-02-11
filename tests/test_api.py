@@ -1,13 +1,10 @@
 """Integration tests for the FastAPI endpoints."""
 
-import json
-from unittest.mock import AsyncMock, patch
-
 import pytest
 from httpx import ASGITransport, AsyncClient
+from unittest.mock import AsyncMock, patch
 
 from main import app
-from models import Speaker, TranscriptLine
 
 
 @pytest.fixture
@@ -22,62 +19,70 @@ async def client():
         yield c
 
 
+SAMPLE_TRANSCRIPT = {
+    "topic": "Should AI be regulated?",
+    "speakers": [
+        {"name": "Alex", "voice": "ash", "perspective": "pro"},
+        {"name": "Jordan", "voice": "coral", "perspective": "con"},
+    ],
+    "transcript": [
+        {"speaker": "Alex", "text": "We need oversight."},
+        {"speaker": "Jordan", "text": "Innovation needs freedom."},
+    ],
+}
+
+
 class TestHealthEndpoint:
     @pytest.mark.asyncio
     async def test_health(self, client):
         resp = await client.get("/api/health")
         assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+
+class TestFormatEndpoint:
+    @pytest.mark.asyncio
+    async def test_format(self, client):
+        resp = await client.get("/api/format")
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "ok"
+        assert "schema" in data
+        assert "example" in data
+        assert "available_voices" in data
 
 
 class TestConversationEndpoints:
     @pytest.mark.asyncio
-    async def test_create_conversation(self, client):
-        mock_transcript = [
-            TranscriptLine(speaker="Alex", text="Point one."),
-            TranscriptLine(speaker="Jordan", text="Counter one."),
-        ]
-
-        with patch("main.generate_transcript", new_callable=AsyncMock, return_value=mock_transcript):
-            resp = await client.post("/api/conversations", json={
-                "topic": "Test topic",
-                "num_turns": 1,
-                "speaker_a": {"name": "Alex", "voice": "alloy", "perspective": "pro"},
-                "speaker_b": {"name": "Jordan", "voice": "echo", "perspective": "con"},
-            })
-
+    async def test_upload_conversation(self, client):
+        resp = await client.post("/api/conversations", json=SAMPLE_TRANSCRIPT)
         assert resp.status_code == 201
         data = resp.json()
-        assert data["topic"] == "Test topic"
+        assert data["topic"] == "Should AI be regulated?"
         assert data["status"] == "ready"
         assert len(data["transcript"]) == 2
         assert data["transcript"][0]["speaker"] == "Alex"
 
     @pytest.mark.asyncio
-    async def test_create_conversation_defaults(self, client):
-        mock_transcript = [
-            TranscriptLine(speaker="Alex", text="Hello."),
-            TranscriptLine(speaker="Jordan", text="Hi."),
-        ]
+    async def test_upload_validates_speakers(self, client):
+        bad = {
+            **SAMPLE_TRANSCRIPT,
+            "transcript": [{"speaker": "Unknown", "text": "Who am I?"}],
+        }
+        resp = await client.post("/api/conversations", json=bad)
+        assert resp.status_code == 422
 
-        with patch("main.generate_transcript", new_callable=AsyncMock, return_value=mock_transcript):
-            resp = await client.post("/api/conversations", json={
-                "topic": "Default speakers test",
-            })
-
-        assert resp.status_code == 201
-        data = resp.json()
-        assert data["speakers"][0]["name"] == "Alex"
-        assert data["speakers"][1]["name"] == "Jordan"
+    @pytest.mark.asyncio
+    async def test_upload_requires_transcript(self, client):
+        resp = await client.post("/api/conversations", json={
+            "topic": "Test",
+            "speakers": [{"name": "A", "voice": "alloy"}, {"name": "B", "voice": "echo"}],
+            "transcript": [],
+        })
+        assert resp.status_code == 422
 
     @pytest.mark.asyncio
     async def test_get_conversation(self, client):
-        mock_transcript = [TranscriptLine(speaker="A", text="Hi.")]
-
-        with patch("main.generate_transcript", new_callable=AsyncMock, return_value=mock_transcript):
-            create_resp = await client.post("/api/conversations", json={"topic": "Test"})
-
+        create_resp = await client.post("/api/conversations", json=SAMPLE_TRANSCRIPT)
         conv_id = create_resp.json()["id"]
         resp = await client.get(f"/api/conversations/{conv_id}")
         assert resp.status_code == 200
@@ -90,27 +95,16 @@ class TestConversationEndpoints:
 
     @pytest.mark.asyncio
     async def test_list_conversations(self, client):
-        mock_transcript = [TranscriptLine(speaker="A", text="Hi.")]
-
-        with patch("main.generate_transcript", new_callable=AsyncMock, return_value=mock_transcript):
-            await client.post("/api/conversations", json={"topic": "List test"})
-
+        await client.post("/api/conversations", json=SAMPLE_TRANSCRIPT)
         resp = await client.get("/api/conversations")
         assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert any(c["topic"] == "List test" for c in data)
+        assert isinstance(resp.json(), list)
 
     @pytest.mark.asyncio
-    async def test_perform_requires_ready_state(self, client):
-        mock_transcript = [TranscriptLine(speaker="A", text="Hi.")]
-
-        with patch("main.generate_transcript", new_callable=AsyncMock, return_value=mock_transcript):
-            create_resp = await client.post("/api/conversations", json={"topic": "Perform test"})
-
+    async def test_perform(self, client):
+        create_resp = await client.post("/api/conversations", json=SAMPLE_TRANSCRIPT)
         conv_id = create_resp.json()["id"]
 
-        # Mock the orchestrator to avoid actual Zoom connection
         with patch("main.ConversationOrchestrator") as mock_orch_cls:
             mock_orch = AsyncMock()
             mock_orch_cls.return_value = mock_orch

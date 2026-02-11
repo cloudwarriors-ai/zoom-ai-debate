@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 
 
 class ConversationStatus(str, Enum):
-    GENERATING = "generating"
     READY = "ready"
     JOINING = "joining"
     PERFORMING = "performing"
@@ -43,11 +42,10 @@ class ConversationProgress(BaseModel):
     current_speaker: str = ""
 
 
-class CreateConversationRequest(BaseModel):
+class UploadTranscriptRequest(BaseModel):
     topic: str
-    num_turns: int = Field(default=6, ge=1, le=50)
-    speaker_a: Speaker = Field(default_factory=lambda: Speaker(name="Alex", voice="alloy"))
-    speaker_b: Speaker = Field(default_factory=lambda: Speaker(name="Jordan", voice="echo"))
+    speakers: list[Speaker] = Field(..., min_length=2, max_length=2)
+    transcript: list[TranscriptLine] = Field(..., min_length=1)
 
 
 class PerformRequest(BaseModel):
@@ -57,7 +55,7 @@ class PerformRequest(BaseModel):
 class Conversation(BaseModel):
     id: str = Field(default_factory=lambda: f"conv_{uuid.uuid4().hex[:12]}")
     topic: str
-    status: ConversationStatus = ConversationStatus.GENERATING
+    status: ConversationStatus = ConversationStatus.READY
     speakers: list[Speaker] = Field(default_factory=list)
     transcript: list[TranscriptLine] = Field(default_factory=list)
     progress: ConversationProgress = Field(default_factory=ConversationProgress)
